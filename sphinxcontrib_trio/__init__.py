@@ -59,16 +59,21 @@ and renders like
 
 from ._version import __version__
 
+from docutils import nodes
 from docutils.parsers.rst import directives
+from docutils.parsers.rst.states import Body
 from sphinx import addnodes
+from sphinx import version_info as sphinx_version_info
 from sphinx.domains.python import PyFunction
 from sphinx.domains.python import PyObject
 from sphinx.domains.python import PyMethod, PyClassMethod, PyStaticMethod
 from sphinx.ext.autodoc import (
     FunctionDocumenter, MethodDocumenter, ClassLevelDocumenter, Options, ModuleLevelDocumenter
 )
+from sphinx.util.docstrings import prepare_docstring
 
 import inspect
+import re
 try:
     from async_generator import isasyncgenfunction
 except ImportError:
@@ -248,6 +253,7 @@ class ExtendedPyStaticMethod(ExtendedCallableMixin, PyStaticMethod):
 # contextlib.contextmanager). So once we see one of these, we stop looking for
 # the others.
 EXCLUSIVE_OPTIONS = {"async", "for", "async-for", "with", "async-with"}
+FIELD_LIST_ITEM_RE = re.compile(Body.patterns['field_marker'])
 
 
 def sniff_options(obj):
@@ -315,6 +321,69 @@ def passthrough_option_lines(self, option_spec):
             else:
                 line = "   :{}:".format(option)
             self.add_line(line, sourcename)
+    doc = self.get_doc()
+    if not doc:
+        return
+    docstring, metadata = separate_metadata("\n".join(sum(doc, [])))
+    if self.objtype == "method":
+        available_options = extended_method_option_spec
+    else:
+        available_options = extended_function_option_spec
+    for option_name, option_value in metadata.items():
+        if option_name not in available_options:
+            continue
+        if option_value:
+            line = "   :{}: {}".format(option_name, option_value)
+        else:
+            line = "   :{}:".format(option_name)
+        self.add_line(line, sourcename)
+
+
+def filter_trio_fields(app, domain, objtype, content):
+    """Filter :trio: field from its docstring."""
+    # implementation based on:
+    # https://github.com/sphinx-doc/sphinx/blob/f127a2ff5d6d86918a5d3ac975e8ab8a24c407d1/sphinx/domains/python.py#L1023-L1035
+    if domain != "py":
+        return
+
+    for node in content:
+        if isinstance(node, nodes.field_list):
+            for field in node:
+                field_name = field[0].astext().strip()
+                if field_name == "trio" or field_name.startswith("trio "):
+                    node.remove(field)
+                    break
+
+
+def separate_metadata(s):
+    """Separate docstring into metadata and others."""
+    # implementation based on:
+    # https://github.com/sphinx-doc/sphinx/blob/f127a2ff5d6d86918a5d3ac975e8ab8a24c407d1/sphinx/util/docstrings.py#L23-L49
+    in_other_element = False
+    metadata: Dict[str, str] = {}
+    lines = []
+
+    if not s:
+        return s, metadata
+
+    for line in prepare_docstring(s):
+        if line.strip() == "":
+            in_other_element = False
+            lines.append(line)
+        else:
+            matched = FIELD_LIST_ITEM_RE.match(line)
+            if matched and not in_other_element:
+                field_name = matched.group()[1:].split(":", 1)[0]
+                if field_name.startswith("trio "):
+                    name = field_name[5:].strip()
+                    metadata[name] = line[matched.end():].strip()
+                else:
+                    lines.append(line)
+            else:
+                in_other_element = True
+                lines.append(line)
+
+    return "\n".join(lines), metadata
 
 
 class ExtendedFunctionDocumenter(FunctionDocumenter):
@@ -396,5 +465,7 @@ def setup(app):
     del directives._directives["automethod"]
     app.add_autodocumenter(ExtendedFunctionDocumenter)
     app.add_autodocumenter(ExtendedMethodDocumenter)
+    if sphinx_version_info >= (2, 4):
+        app.connect("object-description-transform", filter_trio_fields)
 
     return {'version': __version__, 'parallel_read_safe': True}
